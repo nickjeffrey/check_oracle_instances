@@ -1,0 +1,326 @@
+#!/usr/bin/perl -w
+
+
+# OUTSTANDING TASKS
+# -----------------
+
+
+
+#
+# Nagios plugin for validating that all the oracle instances listed in /etc/oratab are running
+# Tested on AIX, should work on any UNIX-like system
+#
+
+
+# CHANGE LOG
+# ---------- 
+#  2018-02-07	njeffrey	Script crated
+#  2019-07-12	njeffrey	Add _ and - to regex for /etc/oratab
+
+
+
+# NOTES
+# -----
+#  This script should return one (and only one) line of ouput.  Multiple
+#  lines of output are silently ignored by nagios.
+#
+#  The line of output will become the body of the alert message sent by nagios
+#
+#
+#  This script is executed remotely on a monitored system by the NRPE or check_by_ssh
+#  methods available in nagios.
+#
+#  If you are using the check_by_ssh method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  This assumes that you already have ssh key pairs configured.
+#   # Define service for checking free space in filesystem
+#   # If no thresholds are specified, default to warn=10% critical=5%
+#   # Thresholds may be defined in %,K,M,G,P (or combinations thereof)
+#   define service{
+#           use                             generic-24x7-service
+#           host_name                       unix11
+#           service_description             oracle instances
+#           check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_oracle_instances"
+#           }
+#
+#  If you are using the check_nrpe method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  This assumes that you already have ssh key pairs configured.
+#   define service{
+#           use                             generic-24x7-service
+#           host_name                       unix11
+#           service_description             oracle instances
+#           check_command                   check_nrpe!check_oracle_instances -t 30
+#           }
+#
+#  If using NRPE, you will also need a section defining the NRPE command in the /usr/local/nagios/nrpe.cfg file that looks like this:
+#   command[check_oracle_instances]=/usr/local/nagios/libexec/check_oracle_instances
+#
+
+
+
+
+use strict;				#enforce good coding practices
+use Getopt::Long;			#allow --long-switches to be used as parameters
+
+# declare variables
+my ($OK,$WARN,$CRITICAL,$UNKNOWN,$CHECK_NAME);
+my ($opt_h,$opt_v);
+my ($verbose,$uname,$ps,%databases,$key,$os);
+my ($listener_running);
+my ($common_output_data,$warn_output_data,$crit_output_data,$perf_data);
+
+
+$CHECK_NAME                 = "oracle instances";
+$verbose                    = "no";			#yes/no variable to increase output for debugging
+$listener_running           = "unknown";		#initialize variable
+#
+# Nagios return codes
+#
+$OK=		0;
+$WARN=		1;
+$CRITICAL=	2;
+$UNKNOWN=	3;
+
+
+
+
+sub get_options {
+   #
+   # this gets the command line parameters provided by the users
+   #
+   print "running get_options subroutine \n" if ($verbose eq "yes");
+   #
+   Getopt::Long::Configure('bundling');
+   GetOptions(
+      "h"   => \$opt_h, "help"       => \$opt_h,
+      "v"   => \$opt_v, "verbose"    => \$opt_v,
+   );
+   #
+   #
+   # Check to see if user provided -h or --help parameter
+   if( $opt_h ) {
+      print "Nagios plugin for validating oracle databases listed in /etc/oratab are running \n";
+      print "Usage:  $0  \n";
+      print "\n\n";
+      exit;
+   }                 
+   #
+   #
+   # Check to see if user provided -v or --verbose parameter
+   if( $opt_v ) {
+      $verbose = "yes";
+   }                 
+}			#end of subroutine
+
+
+
+
+
+sub sanity_checks {
+   #
+   #
+   print "running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   # figure out where the uname command is on this system (varies across UNIX flavors)
+   $uname = "/bin/uname"      if ( -e "/bin/uname" );
+   $uname = "/usr/bin/uname"  if ( -e "/usr/bin/uname" );
+   $uname = "/usr/sbin/uname" if ( -e "/usr/sbin/uname" );
+   $uname = "/sbin/uname"     if ( -e "/sbin/uname" );
+   #
+   # figure out where the ps command is on this system (varies across UNIX flavors)
+   $ps = "/bin/ps"      if ( -e "/bin/ps" );
+   $ps = "/usr/bin/ps"  if ( -e "/usr/bin/ps" );
+   $ps = "/usr/sbin/ps" if ( -e "/usr/sbin/ps" );
+   $ps = "/sbin/ps"     if ( -e "/sbin/ps" );
+   #
+   # Confirm the /etc/oratab file exists and is readable
+   if ( ! -f "/etc/oratab" ) {
+      print "$CHECK_NAME required file /etc/oratab not found \n";
+      exit $UNKNOWN;
+   }
+   if ( ! -r "/etc/oratab" ) {
+      print "$CHECK_NAME required file /etc/oratab is not readable by the nagios user \n";
+      exit $UNKNOWN;
+   }
+}							#end of subroutine
+
+
+
+
+
+
+
+sub read_oratab {
+   #
+   print "running read_oratab subroutine \n" if ($verbose eq "yes");
+   #
+   # read the /etc/oratab file to figure out which database instances should be running
+   #
+   # Sample copy of /etc/oratab
+   # ---------------------------
+   # This file is used by ORACLE utilities.  It is created by root.sh
+   # and updated by the Database Configuration Assistant when creating
+   # a database.
+   #
+   # A colon, ':', is used as the field terminator.  A new line terminates
+   # the entry.  Lines beginning with a pound sign, '#', are comments.
+   #
+   # Entries are of the form:
+   #   $ORACLE_SID:$ORACLE_HOME:<N|Y>:
+   #
+   # The first and second fields are the system identifier and home
+   # directory of the database respectively.  The third filed indicates
+   # to the dbstart utility that the database should , "Y", or should not,
+   # "N", be brought up at system boot time.
+   #
+   # Multiple entries with the same $ORACLE_SID are not allowed.
+   # #QBPROD:/s00/oracle/product/11.2.0.4:Y
+   # #AEFMPREV:/s00/oracle/product/11.2.0.4:Y
+   # QBPROD:/s00/oracle/product/11.2.0.4.6:Y
+   # AEFMPREV:/s00/oracle/product/11.2.0.4.6:Y
+   # MTRXPROD:/s00/oracle/product/11.2.0.4.6:Y
+   # APWFPROD:/s00/oracle/product/11.2.0.4.6:Y
+   # agent12c:/s00/oracle/product/agent12c/agent_inst:N
+   # ##new:/s00/oracle/product/11.2.0.4.6:N
+   # #OAS:/s00/oracle/product/oas10.1.2.2:N
+   # MTRXDEV:/s00/oracle/app/product/18.0.0/dbhome_1:Y
+   #
+   #
+   open (IN,"/etc/oratab") or die "Cannot open /etc/oratab for reading $! \n";
+   while (<IN>) { 					#read a line from the filehandle
+      next if (/^#/);					#skip comment lines that begin with #
+      next if (/:N$/);					#skip lines when the end of the line is :N
+      if (/^([a-zA-Z0-9]+):[a-zA-Z0-9_\-\.\/]+:Y/) {	#regex to find the databases that are supposed to start at boot time
+         $databases{$1}{name}    = $1;			#add the database instance name to a hash
+         $databases{$1}{running} = "unknown";		#initialize hash element
+         print "   found database $1 \n" if ($verbose eq "yes");
+      } 						#end of if block
+   } 							#end of while loop
+   close IN;						#close filehandle
+} 							#end of subroutine
+
+
+sub check_os {
+   #
+   print "running check_os subroutine \n" if ($verbose eq "yes");
+   #
+   # determine which operating system is running
+   # we need to know this because the switches for the ps command are different across UNIX flavours
+   #
+   $os = `$uname`;					#figure out what operating system we are running
+   chomp $os;						#remove newline
+   #
+   $ps = "$ps -ef"  if ( $os eq "AIX");
+   $ps = "$ps -ef"  if ( $os eq "HP-UX");
+   $ps = "$ps -ef"  if ( $os eq "Linux");
+   $ps = "$ps -ef"  if ( $os eq "SunOS");
+   $ps = "$ps -aux" if ( $os eq "FreeBSD");
+   $ps = "$ps -aux" if ( $os eq "NetBSD");
+   $ps = "$ps -aux" if ( $os eq "OpenBSD");
+   $ps = "$ps  aux" if ( $os eq "Darwin");  #MacOS / Darwin does not use - in the parameters
+   #
+   print "   operating system is $os \n" if ($verbose eq "yes");
+}						#end of subroutine
+
+
+
+sub check_for_listener {
+   #
+   print "running check_for_listener subroutine \n" if ($verbose eq "yes");
+   #
+   # confirm the Oracle TNS listener process is running
+   open (IN,"$ps |") or die "Cannot open filehandle $1 \n";
+   while (<IN>) {					#read a line from the filehandle
+      if (/tnslsnr/) {
+         $listener_running = "yes";
+         print "   TNS listener is running \n" if ($verbose eq "yes");
+      } 						#end of if block
+   } 							#end of while loop
+   close IN;						#close filehandle
+} 							#end of subroutine
+
+
+sub check_for_running_instances {
+   #
+   print "running check_for_running_instances subroutine \n" if ($verbose eq "yes");
+   #
+   # confirm all the Oracle database instances set to auto-start in /etc/oratab are currently running
+   foreach $key (sort keys %databases) {                                      #loop through for each database
+      next unless $key;                                                 #skip any blank lines
+      print "   checking to see if $databases{$key}{name} is running \n" if ($verbose eq "yes");
+      open (IN,"$ps |") or die "Cannot open filehandle $1 \n";
+      while (<IN>) {					#read a line from the filehandle
+         if (/ora_pmon_$databases{$key}{name}/) {
+            $databases{$key}{running} = "running";
+            print "   database instance $databases{$key}{name} is running \n" if ($verbose eq "yes");
+         } 						#end of if block
+      } 						#end of while loop
+      close IN;						#close filehandle
+   } 							#end of foreach loop
+} 							#end of subroutine
+
+
+sub print_output {
+   #
+   # this subroutine prints out the results of the nagios check
+   #
+   print "running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   # The nagios performance data will be the same for all the outputs, so just put it in a variable that can be use by all the output options
+   # The format is:  label=value[UOM];[warn];[crit];[min];[max]
+   # On the "label=value" section is required.  The warn|crit|min|max entries are optional.
+   # You can have multiple items of perf data, just separate each section with a space
+   # UOM is Units Of Measurement.    Can be s=seconds B=bytes MB=megabytes %=percent c=counter
+   $perf_data = "";					#this particular check has no performance data
+   #
+   #
+   # Much of the text of the output will be the same.  Put the common stuff in a variable so we can simplify the outputs
+   $common_output_data = "listener_running:$listener_running ";
+   # 
+   foreach $key (sort keys %databases) {                                   #loop through for each database
+      $common_output_data = "$common_output_data $databases{$key}{name}:$databases{$key}{running} ";
+   } 							#end of foreach loop
+   #
+   #
+   # send an alert if the oracle listener is not running
+   if ( $listener_running ne "yes" ) {
+      $crit_output_data = "Listener process tnslsnr is not running, which means no applications will be able to connect to any Oracle database.  Please start the tnslsnr process."; 
+      print "$CHECK_NAME CRITICAL - $crit_output_data  $common_output_data | $perf_data \n";
+      exit $CRITICAL;
+   }
+   #
+   # send an alert if any of the oracle database instances are not running
+   foreach $key (sort keys %databases) {                                   #loop through for each database
+      if ( $databases{$key}{running} ne "running" ) {
+      $warn_output_data = "A database that auto-starts from /etc/oratab is not running.  Please start the database instance."; 
+      print "$CHECK_NAME WARN - $warn_output_data  $common_output_data | $perf_data \n";
+      exit $WARN;
+      } 									#end if if block
+   } 										#end of foreach loop
+   #
+   #
+   #
+   # we should only get this far if everything is ok
+   print "$CHECK_NAME OK - $common_output_data | $perf_data \n";
+   exit $OK;
+}
+
+
+
+
+
+
+
+
+# -----------------------------------------------------------------
+#    main body of program 
+# -----------------------------------------------------------------
+get_options;	
+sanity_checks;
+read_oratab; 
+check_os;
+check_for_listener;	
+check_for_running_instances;
+print_output;	
+
