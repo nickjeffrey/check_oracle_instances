@@ -16,6 +16,7 @@
 # ---------- 
 #  2018-02-07	njeffrey	Script crated
 #  2019-07-12	njeffrey	Add _ and - to regex for /etc/oratab
+#  2020-06-21	njeffrey	Warn if database is restarted (because some flaky apps need to be restarted after a database restart)
 
 
 
@@ -66,14 +67,18 @@ use Getopt::Long;			#allow --long-switches to be used as parameters
 # declare variables
 my ($OK,$WARN,$CRITICAL,$UNKNOWN,$CHECK_NAME);
 my ($opt_h,$opt_v);
-my ($verbose,$uname,$ps,%databases,$key,$os);
-my ($listener_running);
+my ($verbose,$uname,$ps,$ps_switches,%databases,$cmd,$key,$os);
+my ($listener_running,$running_db_count);
+my ($days,$hours,$minutes,$seconds);
+my (%processes,$pid,$etime,$args);
 my ($common_output_data,$warn_output_data,$crit_output_data,$perf_data);
 
 
 $CHECK_NAME                 = "oracle instances";
 $verbose                    = "no";			#yes/no variable to increase output for debugging
 $listener_running           = "unknown";		#initialize variable
+$running_db_count           = 0;			#counter variable for number of running database instances
+$common_output_data         = "";			#initialize variable
 #
 # Nagios return codes
 #
@@ -127,12 +132,30 @@ sub sanity_checks {
    $uname = "/usr/bin/uname"  if ( -e "/usr/bin/uname" );
    $uname = "/usr/sbin/uname" if ( -e "/usr/sbin/uname" );
    $uname = "/sbin/uname"     if ( -e "/sbin/uname" );
+   if ( ! -e $uname ) {
+      print "ERROR: Cannot find $uname binary \n";
+      exit $CRITICAL;
+   }
+   if ( ! -x $uname ) {
+      print "ERROR: $uname is not executable by the current user \n";
+      exit $CRITICAL;
+   }
+   print "   found uname binary at $uname \n" if ($verbose eq "yes");
    #
    # figure out where the ps command is on this system (varies across UNIX flavors)
    $ps = "/bin/ps"      if ( -e "/bin/ps" );
    $ps = "/usr/bin/ps"  if ( -e "/usr/bin/ps" );
    $ps = "/usr/sbin/ps" if ( -e "/usr/sbin/ps" );
    $ps = "/sbin/ps"     if ( -e "/sbin/ps" );
+   if ( ! -e $ps ) {
+      print "ERROR: Cannot find $ps binary \n";
+      exit $CRITICAL;
+   }
+   if ( ! -x $ps ) {
+      print "ERROR: $ps is not executable by the current user \n";
+      exit $CRITICAL;
+   }
+   print "   found ps binary at $ps \n" if ($verbose eq "yes");
    #
    # Confirm the /etc/oratab file exists and is readable
    if ( ! -f "/etc/oratab" ) {
@@ -148,6 +171,157 @@ sub sanity_checks {
 
 
 
+sub determine_os {
+   #
+   print "Running determine_os subroutine \n" if ($verbose eq "yes");
+   #
+   $cmd = "$uname";
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   #open filehandle using command output
+   while (<IN>) {                                                       #read a line from the command output
+      if (/AIX/) {
+         $os          = "AIX";		#figure out OS-specific parameters for ps command
+         $ps_switches = "-ef -o pid,etime,args";
+      } elsif (/Linux/) {
+         $os          = "Linux";
+         $ps_switches = "-ef";    
+      } elsif (/HP-UX/) {
+         $os          = "HP-UX";
+         print "ERROR: this script is has not been tested on $os \n";
+         exit $CRITICAL;
+      } elsif (/SunOS/) {
+         $os          = "SunOS";
+         print "ERROR: this script is has not been tested on $os \n";
+         exit $CRITICAL;
+      } elsif (/FreeBSD/) {
+         $os          = "FreeBSD";
+         print "ERROR: this script is has not been tested on $os \n";
+         exit $CRITICAL;
+      } elsif (/NetBSD/) {
+         $os          = "NetBSD";
+         print "ERROR: this script is has not been tested on $os \n";
+         exit $CRITICAL;
+      } elsif (/OpenBSD/) {
+         $os          = "OpenBSD";
+         print "ERROR: this script is has not been tested on $os \n";
+         exit $CRITICAL;
+      } elsif (/Darwin/) {
+         $os          = "Darwin";
+         print "ERROR: this script is has not been tested on $os \n";
+         exit $CRITICAL;
+      } else {
+         print "ERROR: Cannot determine operating system \n";
+         exit $CRITICAL;
+      } 								#end of if/elsif/else block
+   } 									#end of while loop
+   close IN;								#close filehandle
+   print "   operating system is $os \n" if ($verbose eq "yes");
+   $common_output_data = "$common_output_data OS=$os";			#add OS to the info that will be included in the script output
+}									#end of subroutine
+
+
+
+
+
+sub get_processes {
+   #
+   print "Running get_processes subroutine \n" if ($verbose eq "yes");
+   #
+   # This subroutine runs the "ps" command to get a list of all the processes, and looks for ora_pmon_???? to find oracle databases
+   #
+   if ($os eq "AIX" ) {							#run ps command with switches appropriate for AIX systems
+      #
+      # Output on AIX systems will look similar to the following:
+      #  # ps -ef -o pid,etime,args | grep ora_pmon
+      #   8585236 19-20:56:14 ora_pmon_SYNRGYPT     <--- 19 days, 20 hours, 56 minutes, 14 seconds
+      #   9764982  1-04:09:12 ora_pmon_DEV01        <---  1 day , 04 hours, 09 minutes, 12 seconds
+      #  43712748    14:08:45 ora_pmon_MTRXDEV      <---          14 hours, 08 minutes, 45 seconds
+      #   8248247       02:31 ora_pmon_MTRXTST      <---                    02 minutes, 31 seconds
+      #
+      $cmd = "$ps $ps_switches";
+      print "   running command: $cmd \n" if ($verbose eq "yes");
+      open(IN,"$cmd |");                                               	#open filehandle from command output
+      while (<IN>) {                                                   	#read a line from the command output
+         if ( /([0-9]+) +([0-9:\-]+) +(ora_pmon_.*)/ ) {    		#find processes containing ora_pmon_?????	 
+            $pid   = $1;						#assign more mnemonic variable name
+            $etime = $2;						#assign more mnemonic variable name
+            $args  = $3;						#assign more mnemonic variable name
+            $processes{$pid}{pid}   = $pid;				#put into hash
+            $processes{$pid}{etime} = $etime;				#put into hash
+            $processes{$pid}{args}  = $args;				#put into hash
+            #
+            # Unlike Linux, AIX does not show the elapsed time in seconds, so we need to convert the hours:minutes:seconds format to seconds
+            # convert elapsed time to seconds
+            if ($processes{$pid}{etime} =~ /([0-9][0-9]):([0-9][0-9])/) { 			#find times similar to 56:14 <--- 56 minutes, 14 seconds
+               $minutes = $1;
+               $seconds = $2;
+               $processes{$pid}{etime_seconds} = ($minutes * 60) + $seconds; 
+            }								#end of if block
+            if ($processes{$pid}{etime} =~ /([0-9]+):([0-9][0-9]):([0-9][0-9])/) {		#find times similar to 20:56:14 <--- 20 hours, 56 minutes, 14 seconds
+               $hours   = $1;
+               $minutes = $2;
+               $seconds = $3;
+               $processes{$pid}{etime_seconds} = ($hours * 60 * 60) + ($minutes * 60) + $seconds; 
+            }								#end of if block
+            if ($processes{$pid}{etime} =~ /([0-9]+)\-([0-9]+):([0-9][0-9]):([0-9][0-9])/) {	#find times similar to 19-20:56:14 <--- 19 days, 20 hours, 56 minutes, 14 seconds
+               $days    = $1;
+               $hours   = $2;
+               $minutes = $3;
+               $seconds = $4;
+               $processes{$pid}{etime_seconds} = ($days * 60 * 60 * 24) + ($hours * 60 * 60) + ($minutes * 60) + $seconds; 
+            }								#end of if block
+            print "pid:$processes{$pid}{pid} name:$processes{$pid}{args} etime:$processes{$pid}{etime} etime_seconds:$processes{$pid}{etime_seconds} \n" if ($verbose eq "yes");
+         }								#end of if block
+      }									#end of while loop
+      close IN;								#close filehandle
+   }									#end of if block
+   #
+   #
+   #
+   if ($os eq "Linux" ) {						#run ps command with switches appropriate for Linux systems
+      #
+      # It is assumed you are using the GNU version of ps
+      # Output on Linux systems will look similar to the following:
+      #  # ps -ef | grep ora_pmon                                          <------ this command gets the PID but not the elapsed time
+      #  oracle   22813     1  0 09:07 ?        00:00:00 ora_pmon_DEV01    <------ output shows PID and process start time, but not elapsed time
+      #  # ps -p 22813 -o pid,etimes,args 	                           <------ providing the PID and using "-o etimes" shows elapsed seconds since start
+      #     PID ELAPSED COMMAND						   <------ header row that can be ignored
+      #   22813   61663 ora_pmon_DEV01					   <------ output we want 
+      # 
+      # Unfortunately, we have to provide the specific PID to get the etimes value,   
+      # so we will use a two-pass process on Linux.  First pass gets the PID values, second pass gets etimes.
+      #
+      #
+      $cmd = "$ps $ps_switches";
+      print "   running command: $cmd \n" if ($verbose eq "yes");
+      open(IN,"$cmd |");                                               	#open filehandle from command output
+      while (<IN>) {                                                   	#read a line from the command output
+         if ( /^[a-zA-Z0-9_\-]+ +([0-9]+) +.* ora_pmon_/) { 		#find processes containing ora_pmon_?????	 
+            $pid   = $1;						#assign more mnemonic variable name
+            $processes{$pid}{pid}   = $pid;				#put into hash
+            print "   pid:$processes{$pid}{pid} \n" if ($verbose eq "yes");
+         }								#end of if block
+      }									#end of while loop
+      close IN;								#close filehandle
+      #
+      # At this point, we have a hash containing the PID values, but not the elapsed time.
+      # Now call "ps -p PID -o pid,etimes,args" to get the elapsed time for the processes captured in the first pass
+      foreach $key (sort keys %processes) {
+         $ps_switches = "-p $processes{$key}{pid} -o pid,etimes,args";	#adjust the parameters for ps to include the process id
+         $cmd = "$ps $ps_switches";
+         print "   running command: $cmd \n" if ($verbose eq "yes");
+         open(IN,"$cmd |");                                            	#open filehandle from command output
+         while (<IN>) {                                                	#read a line from the command output
+            if (/[0-9]+ +([0-9]+) +(.*)/) { 				#find the elapsed time in seconds for this PID
+               $processes{$key}{etime_seconds}   = $1;			#put into hash
+               $processes{$key}{args}            = $2;			#put into hash
+               print "   pid:$processes{$pid}{pid} name:$processes{$pid}{args} etime_seconds:$processes{$pid}{etime_seconds} \n" if ($verbose eq "yes");
+            }								#end of if block
+         }								#end of while loop
+         close IN;							#close filehandle
+      }									#end of foreach loop
+   }									#end of if block
+}									#end of subroutine
 
 
 
@@ -201,27 +375,6 @@ sub read_oratab {
 } 							#end of subroutine
 
 
-sub check_os {
-   #
-   print "running check_os subroutine \n" if ($verbose eq "yes");
-   #
-   # determine which operating system is running
-   # we need to know this because the switches for the ps command are different across UNIX flavours
-   #
-   $os = `$uname`;					#figure out what operating system we are running
-   chomp $os;						#remove newline
-   #
-   $ps = "$ps -ef"  if ( $os eq "AIX");
-   $ps = "$ps -ef"  if ( $os eq "HP-UX");
-   $ps = "$ps -ef"  if ( $os eq "Linux");
-   $ps = "$ps -ef"  if ( $os eq "SunOS");
-   $ps = "$ps -aux" if ( $os eq "FreeBSD");
-   $ps = "$ps -aux" if ( $os eq "NetBSD");
-   $ps = "$ps -aux" if ( $os eq "OpenBSD");
-   $ps = "$ps  aux" if ( $os eq "Darwin");  #MacOS / Darwin does not use - in the parameters
-   #
-   print "   operating system is $os \n" if ($verbose eq "yes");
-}						#end of subroutine
 
 
 
@@ -230,14 +383,19 @@ sub check_for_listener {
    print "running check_for_listener subroutine \n" if ($verbose eq "yes");
    #
    # confirm the Oracle TNS listener process is running
-   open (IN,"$ps |") or die "Cannot open filehandle $1 \n";
-   while (<IN>) {					#read a line from the filehandle
-      if (/tnslsnr/) {
-         $listener_running = "yes";
-         print "   TNS listener is running \n" if ($verbose eq "yes");
-      } 						#end of if block
-   } 							#end of while loop
-   close IN;						#close filehandle
+   if ( ($os eq "AIX") || ($os eq "Linux") ) {		#check to see if the tnslsnr is running on AIX or Linux systems
+      $listener_running = "no";				#initialize variable
+      $cmd = "$ps -ef";					#AIX|Linux|HP-UX|SunOS use "ps -ef", while FreeBSD|NetBSD|OpenBSD|Darwin use "ps -aux"
+      print "   running command: $cmd \n" if ($verbose eq "yes");
+      open (IN,"$cmd |") or die "Cannot open filehandle $1 \n";
+      while (<IN>) {					#read a line from the filehandle
+         if (/tnslsnr/) {
+            $listener_running = "yes";
+            print "   TNS listener is running \n" if ($verbose eq "yes");
+         } 						#end of if block
+      } 							#end of while loop
+      close IN;						#close filehandle
+   }							#end of if block
 } 							#end of subroutine
 
 
@@ -253,6 +411,7 @@ sub check_for_running_instances {
       while (<IN>) {					#read a line from the filehandle
          if (/ora_pmon_$databases{$key}{name}/) {
             $databases{$key}{running} = "running";
+            $running_db_count++;			#increment counter
             print "   database instance $databases{$key}{name} is running \n" if ($verbose eq "yes");
          } 						#end of if block
       } 						#end of while loop
@@ -276,15 +435,25 @@ sub print_output {
    #
    #
    # Much of the text of the output will be the same.  Put the common stuff in a variable so we can simplify the outputs
-   $common_output_data = "listener_running:$listener_running ";
+   $common_output_data = "OS=$os listener_running:$listener_running running_databases:$running_db_count";
    # 
    foreach $key (sort keys %databases) {                                   #loop through for each database
       $common_output_data = "$common_output_data $databases{$key}{name}:$databases{$key}{running} ";
    } 							#end of foreach loop
    #
    #
-   # send an alert if the oracle listener is not running
-   if ( $listener_running ne "yes" ) {
+   # figure out the details of the running database instances
+   foreach $key (sort keys %processes) {
+      print "pid:$processes{$key}{pid} \n" if ($verbose eq "yes");
+      $common_output_data = "$common_output_data, database:$processes{$key}{args} pid:$processes{$key}{pid} seconds_uptime:$processes{$key}{etime_seconds}";
+      print "common_output_data: $common_output_data \n" if ($verbose eq "yes");
+   }                                                                    #end of foreach loop
+   $common_output_data =~ s/^,//;					#get rid of leading comma
+   $common_output_data =~ s/  / /g;					#collapse multiple spaces into a single space
+   #
+   #
+   # If at least one database instance is running, send an alert if the oracle listener is not running 
+   if ( ($running_db_count > 0) && ($listener_running ne "yes") ) {
       $crit_output_data = "Listener process tnslsnr is not running, which means no applications will be able to connect to any Oracle database.  Please start the tnslsnr process."; 
       print "$CHECK_NAME CRITICAL - $crit_output_data  $common_output_data | $perf_data \n";
       exit $CRITICAL;
@@ -299,7 +468,21 @@ sub print_output {
       } 									#end if if block
    } 										#end of foreach loop
    #
-   #
+   # Send alert if any database has been up for less than 15 minutes (15 * 60 = 900 seconds)
+   foreach $key (sort keys %processes) {
+      if ( $processes{$key}{etime_seconds} < 900 ) { 
+         if ( $processes{$key}{args} =~ /ora_pmon_FOOBAR/ ) { 		#custom error message for this particular database
+            $warn_output_data = "Recent restart detected for $processes{$key}{args} database.  The FOOBAR application needs to be restarted if it loses connection to the database.  Please run the FOOBAR stop/start scripts.  $common_output_data";
+            print "$CHECK_NAME WARN - $warn_output_data  $common_output_data | $perf_data \n";
+            exit $WARN;
+         } 								#end of if block
+      } 								#end of if block
+      if ( $processes{$key}{etime_seconds} < 900 ) { 
+         $warn_output_data = "Recent restart detected for $processes{$key}{args} database.  Please confirm all applications that depend on this database are running normally.  $common_output_data";
+         print "$CHECK_NAME WARN - $warn_output_data  $common_output_data | $perf_data \n";
+         exit $WARN;
+      } 								#end of if block
+   } 									#end of foreach loop
    #
    # we should only get this far if everything is ok
    print "$CHECK_NAME OK - $common_output_data | $perf_data \n";
@@ -318,8 +501,9 @@ sub print_output {
 # -----------------------------------------------------------------
 get_options;	
 sanity_checks;
+determine_os;
+get_processes;
 read_oratab; 
-check_os;
 check_for_listener;	
 check_for_running_instances;
 print_output;	
