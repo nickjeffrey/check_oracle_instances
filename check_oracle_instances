@@ -79,6 +79,7 @@ $verbose                    = "no";			#yes/no variable to increase output for de
 $listener_running           = "unknown";		#initialize variable
 $running_db_count           = 0;			#counter variable for number of running database instances
 $common_output_data         = "";			#initialize variable
+$warn_output_data           = "";			#initialize variable
 #
 # Nagios return codes
 #
@@ -315,7 +316,7 @@ sub get_processes {
             if (/[0-9]+ +([0-9]+) +(.*)/) { 				#find the elapsed time in seconds for this PID
                $processes{$key}{etime_seconds}   = $1;			#put into hash
                $processes{$key}{args}            = $2;			#put into hash
-               print "   pid:$processes{$pid}{pid} name:$processes{$pid}{args} etime_seconds:$processes{$pid}{etime_seconds} \n" if ($verbose eq "yes");
+               print "   pid:$processes{$key}{pid} name:$processes{$key}{args} etime_seconds:$processes{$key}{etime_seconds} \n" if ($verbose eq "yes");
             }								#end of if block
          }								#end of while loop
          close IN;							#close filehandle
@@ -393,10 +394,13 @@ sub check_for_listener {
             $listener_running = "yes";
             print "   TNS listener is running \n" if ($verbose eq "yes");
          } 						#end of if block
-      } 							#end of while loop
+      } 						#end of while loop
       close IN;						#close filehandle
+      print "   TNS listener is not running \n" if ( ($verbose eq "yes") && ($listener_running ne "yes") );
    }							#end of if block
 } 							#end of subroutine
+
+
 
 
 sub check_for_running_instances {
@@ -404,20 +408,24 @@ sub check_for_running_instances {
    print "running check_for_running_instances subroutine \n" if ($verbose eq "yes");
    #
    # confirm all the Oracle database instances set to auto-start in /etc/oratab are currently running
-   foreach $key (sort keys %databases) {                                      #loop through for each database
-      next unless $key;                                                 #skip any blank lines
-      print "   checking to see if $databases{$key}{name} is running \n" if ($verbose eq "yes");
-      open (IN,"$ps |") or die "Cannot open filehandle $1 \n";
-      while (<IN>) {					#read a line from the filehandle
-         if (/ora_pmon_$databases{$key}{name}/) {
-            $databases{$key}{running} = "running";
-            $running_db_count++;			#increment counter
-            print "   database instance $databases{$key}{name} is running \n" if ($verbose eq "yes");
-         } 						#end of if block
-      } 						#end of while loop
-      close IN;						#close filehandle
-   } 							#end of foreach loop
+   if ( ($os eq "AIX") || ($os eq "Linux") ) {		#check to see if database instances are running on AIX or Linux systems
+      foreach $key (sort keys %databases) {             #loop through for each database
+         next unless $key;                              #skip any blank lines
+         print "   checking to see if $databases{$key}{name} is running with process name ora_pmon_$databases{$key}{name} \n" if ($verbose eq "yes");
+         open (IN,"$ps -ef |") or die "Cannot open filehandle $1 \n";
+         while (<IN>) {					#read a line from the filehandle
+            if (/ora_pmon_$databases{$key}{name}/) {
+               $databases{$key}{running} = "running";
+               $running_db_count++;			#increment counter
+               print "   database instance $databases{$key}{name} is running \n" if ($verbose eq "yes");
+            } 						#end of if block
+         } 						#end of while loop
+         close IN;						#close filehandle
+      } 						#end of foreach loop
+   } 							#end of if block
 } 							#end of subroutine
+
+
 
 
 sub print_output {
@@ -454,35 +462,38 @@ sub print_output {
    #
    # If at least one database instance is running, send an alert if the oracle listener is not running 
    if ( ($running_db_count > 0) && ($listener_running ne "yes") ) {
-      $crit_output_data = "Listener process tnslsnr is not running, which means no applications will be able to connect to any Oracle database.  Please start the tnslsnr process."; 
+      $crit_output_data = "Listener process tnslsnr is not running, which means no applications will be able to connect to any Oracle database.  Please start the tnslsnr."; 
       print "$CHECK_NAME CRITICAL - $crit_output_data  $common_output_data | $perf_data \n";
       exit $CRITICAL;
    }
    #
+   #
    # send an alert if any of the oracle database instances are not running
    foreach $key (sort keys %databases) {                                   #loop through for each database
       if ( $databases{$key}{running} ne "running" ) {
-      $warn_output_data = "A database that auto-starts from /etc/oratab is not running.  Please start the database instance."; 
+      $warn_output_data = "$warn_output_data  A database that auto-starts from /etc/oratab is not running.  Please start the database instance."; 
       print "$CHECK_NAME WARN - $warn_output_data  $common_output_data | $perf_data \n";
       exit $WARN;
       } 									#end if if block
    } 										#end of foreach loop
    #
+   #
    # Send alert if any database has been up for less than 15 minutes (15 * 60 = 900 seconds)
    foreach $key (sort keys %processes) {
       if ( $processes{$key}{etime_seconds} < 900 ) { 
          if ( $processes{$key}{args} =~ /ora_pmon_FOOBAR/ ) { 		#custom error message for this particular database
-            $warn_output_data = "Recent restart detected for $processes{$key}{args} database.  The FOOBAR application needs to be restarted if it loses connection to the database.  Please run the FOOBAR stop/start scripts.  $common_output_data";
+            $warn_output_data = "$warn_output_data  Recent restart detected for $processes{$key}{args} database.  The FOOBAR application needs to be restarted if it loses connection to the database.  Please run the FOOBAR stop/start scripts.  $common_output_data";
             print "$CHECK_NAME WARN - $warn_output_data  $common_output_data | $perf_data \n";
             exit $WARN;
          } 								#end of if block
       } 								#end of if block
       if ( $processes{$key}{etime_seconds} < 900 ) { 
-         $warn_output_data = "Recent restart detected for $processes{$key}{args} database.  Please confirm all applications that depend on this database are running normally.  $common_output_data";
+         $warn_output_data = "$warn_output_data  Recent restart detected for $processes{$key}{args} database.  Please confirm all applications that depend on this database are running normally.  $common_output_data";
          print "$CHECK_NAME WARN - $warn_output_data  $common_output_data | $perf_data \n";
          exit $WARN;
       } 								#end of if block
    } 									#end of foreach loop
+   #
    #
    # we should only get this far if everything is ok
    print "$CHECK_NAME OK - $common_output_data | $perf_data \n";
